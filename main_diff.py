@@ -1,32 +1,42 @@
 # -*-coding:utf-8-*-
-
+# -*-coding:utf-8-*-
+# -*-coding:utf-8-*-
+# -*-coding:utf-8-*-
+# -*-coding:utf-8-*-
+# -*-coding:utf-8-*-
+# -*-coding:utf-8-*-
+# -*-coding:utf-8-*-
+# -*-coding:utf-8-*-
 import json
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from mmaction.core.evaluation import ActivityNetLocalization
 from mmaction.localization import soft_nms
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import torch.nn as nn
+
 from datasetv3 import VideoDataset
-from model_diff import Model, cross_entropy, generalized_cross_entropy
-from utils import parse_args, oic_score, revert_frame, grouping, result2json, filter_results
+from utils_anet import parse_args, oic_score, revert_frame, grouping, result2json, filter_results
+from model_anet_yuanshi_diff_v1_0 import Model, cross_entropy, generalized_cross_entropy,calculate_score
 
 
 def loop1(net, data_loader, num_iter):
     net.eval()
     results, num_correct, num_total, test_info = {'results': {}}, 0, 0, {}
+    index=0
     with torch.no_grad():
-        for data, gt, video_name, num_seg in tqdm(data_loader, initial=1, dynamic_ncols=True):
+        for data, gt, video_name, num_seg,in tqdm(data_loader, initial=1, dynamic_ncols=True):
             data, gt = data.cuda(non_blocking=True), gt.squeeze(0).cuda(non_blocking=True)
             video_name, num_seg = video_name[0], num_seg.squeeze(0)
-            act_score, bkg_score, seg_score, seg_mask, \
-            aas_rgb, aas_flow,cas= net.infer_run(data,None)
 
+
+            act_score,  seg_score= net.infer(data)
             # [C],  [T, C]
             act_score, seg_score = act_score.squeeze(0), seg_score.squeeze(0)
 
@@ -90,6 +100,7 @@ def loop1(net, data_loader, num_iter):
         print(desc)
         return test_info
 
+
 def save_loop(net, data_loader, num_iter,flag):
     global best_mAP
     test_info = loop1(net, data_loader, num_iter)
@@ -112,6 +123,7 @@ def save_loop(net, data_loader, num_iter,flag):
                 metric_info[key] = []
             metric_info[key].append('{:.3f}'.format(value))
 
+    # save statistics
     data_frame = pd.DataFrame(data=metric_info, index=range(1, (num_iter if args.model_file
                                                                 else num_iter // args.eval_iter) + 1))
     data_frame.to_csv('{}/{}.csv'.format(args.save_path, args.data_name), index_label='Step', float_format='%.3f')
@@ -119,38 +131,27 @@ def save_loop(net, data_loader, num_iter,flag):
         best_mAP = test_info['mAP@AVG']
         torch.save(net.state_dict(), '{}/{}.pth'.format(args.save_path, args.data_name))
 
+
+def lossum(args, feat, label, seg_mask):
+    n, t, c = feat.shape
+    label1 = torch.unsqueeze(label, dim=1).expand(n, t, c)
+    seg_mask_cas = seg_mask * label1
+    feat_act = feat * seg_mask_cas
+    feat_bkg = feat * (1 - seg_mask_cas)
+    loss_act = args.margin - torch.norm(torch.mean(feat_act, dim=1), p=2, dim=1)
+    loss_act[loss_act < 0] = 0
+    loss_bkg = torch.norm(torch.mean(feat_bkg, dim=1), p=2, dim=1)
+    loss_um = torch.mean((loss_act + loss_bkg) ** 2)
+    return loss_um
+
 if __name__ == '__main__':
     args = parse_args()
-
     device = torch.device("cuda")
-
-    diffusion_params= {
-        "timesteps": 1000,
-        "sampling_timesteps": 10,
-        "ddim_sampling_eta": 1.0,
-        "snr_scale": 0.5,
-        "cond_types": [
-            "full",
-            "zero",
-            "boundary03-",
-            "segment=1",
-            "segment=1"
-        ],
-        "detach_decoder": False
-    }
-
-    decoder_params= {
-        "num_layers": 1,
-        "num_f_maps": 100,
-        "time_emb_dim": 100,
-        "kernel_size": 3,
-        "dropout_rate": 0.1
-    }
 
     test_data = VideoDataset(args.data_path, args.data_name, 'test', args.num_seg)
     test_loader = DataLoader(test_data, 1, False, num_workers=args.workers, pin_memory=True)
 
-    model = Model(len(test_data.class_to_idx),diffusion_params,decoder_params,device).cuda()
+    model = Model(len(test_data.class_to_idx),args.diffusion_params,args.decoder_params,device).cuda()
     best_mAP, metric_info = 0, {}
     if args.model_file:
         model.load_state_dict(torch.load(args.model_file))
@@ -163,40 +164,77 @@ if __name__ == '__main__':
         train_loader = iter(DataLoader(train_data, args.batch_size, True, num_workers=args.workers, pin_memory=True))
         optimizer = Adam(model.parameters(), lr=args.init_lr, weight_decay=args.weight_decay)
         lr_scheduler = CosineAnnealingLR(optimizer, T_max=args.num_iter)
-
-        total_loss, total_num, metric_info['Loss'] = 0.0, 0, []
-        train_bar = tqdm(range(1, args.num_iter + 1), initial=1, dynamic_ncols=True)
-
-        ce_criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
         flag = 1
         mse_criterion = nn.MSELoss(reduction='none')
-        criterion_frame = MultiCrossEntropyLoss()
+
+        mask_bank={}
+        diff_start=1000
+        total_loss, total_num, metric_info['Loss'] = 0.0, 0, []
+        train_bar = tqdm(range(1, args.num_iter + 1), initial=1, dynamic_ncols=True)
         for step in train_bar:
-            feat, label, _, _ = next(train_loader)
+            feat, label, video_name, _ = next(train_loader)
             feat, label = feat.cuda(non_blocking=True), label.cuda(non_blocking=True)
-            act_score, bkg_score, seg_score, seg_mask, \
-            aas_rgb, aas_flow,cas,atn_rgb,atn_flow ,\
-            atn_rgb0,atn_flow0,mse_loss,\
-            ce_loss,bce_loss= model(feat,label,ce_criterion,mse_criterion,criterion_frame)
+
+
+            if len(mask_bank)<4773:
+                seg_score, aas_rgb, aas_flow, atn_rgb, \
+                atn_flow, atn_rgb0, atn_flow0, cas = model.cas_attention(feat)
+
+                seg_mask=model.local_mask(seg_score,cas)
+                # [N, C]
+                act_score, bkg_score = calculate_score(seg_score, seg_mask, cas)
+
+                for vid in range(len(video_name)):
+                    v_name = video_name[vid]
+                    mask_bank[v_name] = seg_mask[vid]
+
+                mse_loss=0.
+            else:
+
+                seg_mask_list = []
+                for vid in range(len(video_name)):
+                    v_name = video_name[vid]
+                    sss = torch.unsqueeze(mask_bank.get(v_name), dim=0)
+                    seg_mask_list.append(sss)
+                seg_mask_list = torch.cat(seg_mask_list, dim=0)
+
+                seg_score, aas_rgb, aas_flow, atn_rgb, \
+                atn_flow, atn_rgb0, atn_flow0, cas = model.cas_attention(feat)
+
+                seg_mask = model.local_mask(seg_score, cas)
+
+                event_out=model.diffusion_pro(cas.transpose(-1, -2),seg_mask_list.transpose(-1, -2))
+
+                # cas1 = cas * 0.7 + event_out * 0.3
+                cas1 = cas + event_out
+                cas_score1 = torch.softmax(cas1, dim=-1)
+
+                act_score, bkg_score = calculate_score(seg_score, seg_mask, cas1)
+                # act_score=(act_score+act_score2)/2
+                # bkg_score=(bkg_score+bkg_score2)/2
+                # seg_score = cas_score1 * self.beta + seg_score * (1 - self.beta)
+
+                decoder_mse_loss = torch.clamp(mse_criterion(
+                    F.log_softmax(event_out, dim=-1), seg_mask),
+                    min=0, max=16)
+
+                mse_loss = decoder_mse_loss.mean()
+
+                for vid in range(len(video_name)):
+                    v_name = video_name[vid]
+                    mask_bank[v_name] = seg_mask[vid]
 
             cas_loss = cross_entropy(act_score, bkg_score, label)
-
             aas_rgb_loss = generalized_cross_entropy(aas_rgb, seg_mask, label)
             aas_flow_loss = generalized_cross_entropy(aas_flow, seg_mask, label)
             atn_rgb_loss = generalized_cross_entropy(atn_rgb, seg_mask, label)
             atn_flow_loss = generalized_cross_entropy(atn_flow, seg_mask, label)
-            atn_rgb0_loss = generalized_cross_entropy(atn_rgb0, seg_mask, label)
-            atn_flow0_loss = generalized_cross_entropy(atn_flow0, seg_mask, label)
 
             loss_um = lossum(args, cas, label, seg_mask)
-            loss_frame = lossum(args, seg_score, label, seg_mask)
 
-            loss = ce_loss+args.beta1*bce_loss+ args.beta *(loss_um+loss_frame)+\
-                   cas_loss +\
+            loss =mse_loss+ cas_loss + args.beta * loss_um+ \
                    args.lamda * (aas_rgb_loss + aas_flow_loss
-                                 +atn_rgb_loss+atn_flow_loss
-                                 +atn_rgb0_loss+atn_flow0_loss
-                                 )  #
+                                 +atn_rgb_loss + atn_flow_loss)
 
             optimizer.zero_grad()
             loss.backward()
@@ -207,7 +245,7 @@ if __name__ == '__main__':
             train_bar.set_description('Train Step: [{}/{}] Loss: {:.3f}'
                                       .format(step, args.num_iter, total_loss / total_num))
             lr_scheduler.step()
-            if step>=800 and step % args.eval_iter == 0:
+            if step>=2000 and step % args.eval_iter == 0:
                 metric_info['Loss'].append('{:.3f}'.format(total_loss / total_num))
                 save_loop(model, test_loader, step, flag)
                 flag += 1
